@@ -1,7 +1,9 @@
 package graphite
 
 import (
+	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -50,6 +52,38 @@ const (
 	DefaultUDPReadBuffer = 0
 )
 
+// TemplateConfig holds the configuration for a single template.
+type TemplateConfig struct {
+	Format   string `toml:"format"`
+	Template string `toml:"template"`
+	Filter   string `toml:"filter"`
+}
+
+func SimpleTemplates(patterns []string) []TemplateConfig {
+	templates := make([]TemplateConfig, 0, len(patterns))
+	for _, pattern := range patterns {
+		// Extract the filter from a template of the form: [filter] <template> [tag1=value1,tag2=value2]
+		parts := strings.Fields(pattern)
+		if len(parts) < 1 {
+			continue
+		} else if len(parts) >= 2 {
+			if !strings.Contains(parts[1], "=") {
+				templates = append(templates, TemplateConfig{
+					Format:   "simple",
+					Template: strings.Join(parts[1:], " "),
+					Filter:   parts[0],
+				})
+				continue
+			}
+		}
+		templates = append(templates, TemplateConfig{
+			Format:   "simple",
+			Template: pattern,
+		})
+	}
+	return templates
+}
+
 // Config represents the configuration for Graphite endpoints.
 type Config struct {
 	Enabled          bool          `toml:"enabled"`
@@ -61,10 +95,13 @@ type Config struct {
 	BatchPending     int           `toml:"batch-pending"`
 	BatchTimeout     toml.Duration `toml:"batch-timeout"`
 	ConsistencyLevel string        `toml:"consistency-level"`
-	Templates        []string      `toml:"templates"`
-	Tags             []string      `toml:"tags"`
-	Separator        string        `toml:"separator"`
-	UDPReadBuffer    int           `toml:"udp-read-buffer"`
+	// Template holds the advanced template definitions.
+	Template []TemplateConfig `toml:"template"`
+	// Templates holds the quick template definitions.
+	Templates     []string `toml:"templates"`
+	Tags          []string `toml:"tags"`
+	Separator     string   `toml:"separator"`
+	UDPReadBuffer int      `toml:"udp-read-buffer"`
 }
 
 // NewConfig returns a new instance of Config with defaults.
@@ -202,6 +239,38 @@ func (c *Config) validateTemplates() error {
 			}
 		}
 	}
+
+	for i, t := range c.Template {
+		if t.Template == "" {
+			return fmt.Errorf("missing template at position: %d", i+len(c.Templates))
+		}
+
+		switch t.Format {
+		case "simple", "":
+			if err := c.validateTemplate(t.Template); err != nil {
+				return err
+			}
+		case "regexp":
+			if err := c.validateRegexpTemplate(t.Template); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unknown template format '%s' at position: %d", t.Format, i+len(c.Templates))
+		}
+
+		// Prevent duplicate filters in the config.
+		if _, ok := filters[t.Filter]; ok {
+			return fmt.Errorf("duplicate filter '%s' found at position: %d", t.Filter, i+len(c.Templates))
+		}
+		filters[t.Filter] = struct{}{}
+
+		if t.Filter != "" {
+			// Validate filter expression is valid
+			if err := c.validateFilter(t.Filter); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -226,6 +295,26 @@ func (c *Config) validateTemplate(template string) error {
 		return fmt.Errorf("no measurement in template `%s`", template)
 	}
 
+	return nil
+}
+
+func (c *Config) validateRegexpTemplate(template string) error {
+	re, err := regexp.Compile(template)
+	if err != nil {
+		return err
+	}
+
+	var hasMeasurement bool
+	for _, name := range re.SubexpNames() {
+		switch name {
+		case "measurement":
+			hasMeasurement = true
+		}
+	}
+
+	if !hasMeasurement {
+		return errors.New("measurement must be included as a named capture group")
+	}
 	return nil
 }
 

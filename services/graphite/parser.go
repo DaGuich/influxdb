@@ -1,8 +1,10 @@
 package graphite
 
 import (
+	"errors"
 	"fmt"
 	"math"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,7 +22,7 @@ var (
 	MaxDate = time.Date(2038, 1, 19, 0, 0, 0, 0, time.UTC)
 )
 
-var defaultTemplate *template
+var defaultTemplate Template
 
 func init() {
 	var err error
@@ -39,7 +41,7 @@ type Parser struct {
 // Options are configurable values that can be provided to a Parser.
 type Options struct {
 	Separator   string
-	Templates   []string
+	Templates   []TemplateConfig
 	DefaultTags models.Tags
 }
 
@@ -49,47 +51,52 @@ func NewParserWithOptions(options Options) (*Parser, error) {
 	matcher := newMatcher()
 	matcher.AddDefaultTemplate(defaultTemplate)
 
-	for _, pattern := range options.Templates {
-
-		template := pattern
-		filter := ""
-		// Format is [filter] <template> [tag1=value1,tag2=value2]
-		parts := strings.Fields(pattern)
-		if len(parts) < 1 {
-			continue
-		} else if len(parts) >= 2 {
-			if strings.Contains(parts[1], "=") {
-				template = parts[0]
-			} else {
-				filter = parts[0]
-				template = parts[1]
-			}
+	for _, config := range options.Templates {
+		template, err := compileTemplate(config, options)
+		if err != nil {
+			return nil, err
 		}
+		matcher.Add(config.Filter, template)
+	}
+	return &Parser{matcher: matcher, tags: options.DefaultTags}, nil
+}
+
+func compileTemplate(config TemplateConfig, options Options) (Template, error) {
+	switch config.Format {
+	case "simple", "":
+		// Format is <template> [tag1=value1,tag2=value2]
+		parts := strings.Fields(config.Template)
+		if len(parts) < 1 {
+			return nil, errors.New("template is empty")
+		} else if len(parts) > 2 {
+			return nil, fmt.Errorf("template has too many sections: %s", config.Template)
+		} else if len(parts) == 2 && !strings.Contains(parts[1], "=") {
+			return nil, fmt.Errorf("template tags must contains an equals sign: %s", parts[1])
+		}
+		template := parts[0]
 
 		// Parse out the default tags specific to this template
 		var tags models.Tags
-		if strings.Contains(parts[len(parts)-1], "=") {
-			tagStrs := strings.Split(parts[len(parts)-1], ",")
+		if len(parts) == 2 {
+			tagStrs := strings.Split(parts[1], ",")
 			for _, kv := range tagStrs {
 				parts := strings.Split(kv, "=")
 				tags.SetString(parts[0], parts[1])
 			}
 		}
-
-		tmpl, err := NewTemplate(template, tags, options.Separator)
-		if err != nil {
-			return nil, err
-		}
-		matcher.Add(filter, tmpl)
+		return NewTemplate(template, tags, options.Separator)
+	case "regexp":
+		return NewRegexpTemplate(config.Template)
+	default:
+		return nil, fmt.Errorf("invalid template format: %s", config.Format)
 	}
-	return &Parser{matcher: matcher, tags: options.DefaultTags}, nil
 }
 
 // NewParser returns a GraphiteParser instance.
 func NewParser(templates []string, defaultTags models.Tags) (*Parser, error) {
 	return NewParserWithOptions(
 		Options{
-			Templates:   templates,
+			Templates:   SimpleTemplates(templates),
 			DefaultTags: defaultTags,
 			Separator:   DefaultSeparator,
 		})
@@ -182,8 +189,12 @@ func (p *Parser) ApplyTemplate(line string) (string, map[string]string, string, 
 	return name, tags, field, err
 }
 
-// template represents a pattern and tags to map a graphite metric string to a influxdb Point.
-type template struct {
+type Template interface {
+	Apply(line string) (string, map[string]string, string, error)
+}
+
+// simpleTemplate represents a pattern and tags to map a graphite metric string to a influxdb Point.
+type simpleTemplate struct {
 	tags              []string
 	defaultTags       models.Tags
 	greedyMeasurement bool
@@ -192,10 +203,10 @@ type template struct {
 
 // NewTemplate returns a new template ensuring it has a measurement
 // specified.
-func NewTemplate(pattern string, defaultTags models.Tags, separator string) (*template, error) {
+func NewTemplate(pattern string, defaultTags models.Tags, separator string) (Template, error) {
 	tags := strings.Split(pattern, ".")
 	hasMeasurement := false
-	template := &template{tags: tags, defaultTags: defaultTags, separator: separator}
+	template := &simpleTemplate{tags: tags, defaultTags: defaultTags, separator: separator}
 
 	for _, tag := range tags {
 		if strings.HasPrefix(tag, "measurement") {
@@ -215,7 +226,7 @@ func NewTemplate(pattern string, defaultTags models.Tags, separator string) (*te
 
 // Apply extracts the template fields from the given line and returns the measurement
 // name and tags.
-func (t *template) Apply(line string) (string, map[string]string, string, error) {
+func (t *simpleTemplate) Apply(line string) (string, map[string]string, string, error) {
 	fields := strings.Split(line, ".")
 	var (
 		measurement            []string
@@ -274,11 +285,67 @@ func (t *template) Apply(line string) (string, map[string]string, string, error)
 	return strings.Join(measurement, t.separator), out_tags, field, nil
 }
 
+type regexpTemplate struct {
+	re *regexp.Regexp
+}
+
+func NewRegexpTemplate(pattern string) (Template, error) {
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, err
+	}
+
+	// The template must have a capture pattern for measurement and field.
+	var hasMeasurement bool
+	for _, name := range re.SubexpNames() {
+		switch name {
+		case "measurement":
+			hasMeasurement = true
+		}
+	}
+
+	if !hasMeasurement {
+		return nil, errors.New("measurement must be included as a named capture group")
+	}
+	return &regexpTemplate{re: re}, nil
+}
+
+func (t *regexpTemplate) Apply(line string) (string, map[string]string, string, error) {
+	var (
+		measurement, field string
+		tags               = make(map[string]string)
+	)
+
+	m := t.re.FindStringSubmatch(line)
+	if m == nil {
+		return "", nil, "", fmt.Errorf("unable to match '%s' to regular expression /%s/", line, t.re.String())
+	}
+
+	for i, name := range t.re.SubexpNames() {
+		if name == "" {
+			continue
+		}
+
+		switch name {
+		case "measurement":
+			measurement = m[i]
+		case "field":
+			field = m[i]
+		default:
+			tags[name] = m[i]
+		}
+	}
+	if field == "" {
+		field = "value"
+	}
+	return measurement, tags, field, nil
+}
+
 // matcher determines which template should be applied to a given metric
 // based on a filter tree.
 type matcher struct {
 	root            *node
-	defaultTemplate *template
+	defaultTemplate Template
 }
 
 func newMatcher() *matcher {
@@ -288,7 +355,7 @@ func newMatcher() *matcher {
 }
 
 // Add inserts the template in the filter tree based the given filter.
-func (m *matcher) Add(filter string, template *template) {
+func (m *matcher) Add(filter string, template Template) {
 	if filter == "" {
 		m.AddDefaultTemplate(template)
 		return
@@ -296,12 +363,12 @@ func (m *matcher) Add(filter string, template *template) {
 	m.root.Insert(filter, template)
 }
 
-func (m *matcher) AddDefaultTemplate(template *template) {
+func (m *matcher) AddDefaultTemplate(template Template) {
 	m.defaultTemplate = template
 }
 
 // Match returns the template that matches the given graphite line.
-func (m *matcher) Match(line string) *template {
+func (m *matcher) Match(line string) Template {
 	tmpl := m.root.Search(line)
 	if tmpl != nil {
 		return tmpl
@@ -315,10 +382,10 @@ func (m *matcher) Match(line string) *template {
 type node struct {
 	value    string
 	children nodes
-	template *template
+	template Template
 }
 
-func (n *node) insert(values []string, template *template) {
+func (n *node) insert(values []string, template Template) {
 	// Add the end, set the template
 	if len(values) == 0 {
 		n.template = template
@@ -350,11 +417,11 @@ func (n *node) insert(values []string, template *template) {
 
 // Insert inserts the given string template into the tree.  The filter string is separated
 // on "." and each part is used as the path in the tree.
-func (n *node) Insert(filter string, template *template) {
+func (n *node) Insert(filter string, template Template) {
 	n.insert(strings.Split(filter, "."), template)
 }
 
-func (n *node) search(lineParts []string) *template {
+func (n *node) search(lineParts []string) Template {
 	// Nothing to search
 	if len(lineParts) == 0 || len(n.children) == 0 {
 		return n.template
@@ -384,7 +451,7 @@ func (n *node) search(lineParts []string) *template {
 	return n.template
 }
 
-func (n *node) Search(line string) *template {
+func (n *node) Search(line string) Template {
 	return n.search(strings.Split(line, "."))
 }
 
