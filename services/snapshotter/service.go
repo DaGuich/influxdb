@@ -17,7 +17,6 @@ import (
 	"github.com/influxdata/influxdb/services/meta"
 	"github.com/influxdata/influxdb/tsdb"
 	"go.uber.org/zap"
-	"io"
 )
 
 const (
@@ -45,6 +44,9 @@ type Service struct {
 		ExportShard(id uint64, ExportStart time.Time, ExportEnd time.Time, w io.Writer) error
 		Shard(id uint64) *tsdb.Shard
 		ShardRelativePath(id uint64) (string, error)
+		SetShardEnabled(shardID uint64, enabled bool) error
+		RestoreShard(id uint64, r io.Reader) error
+		CreateShard(database, retentionPolicy string, shardID uint64, enabled bool) error
 	}
 
 	Listener net.Listener

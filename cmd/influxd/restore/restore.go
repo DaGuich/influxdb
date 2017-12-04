@@ -48,7 +48,7 @@ type Command struct {
 	backupRetention     string
 	restoreRetention    string
 	shard               string
-	legacy              bool
+	enterprise          bool
 	online              bool
 	manifest            backup_util.Manifest
 
@@ -76,8 +76,8 @@ func (cmd *Command) Run(args ...string) error {
 		return err
 	}
 
-	if !cmd.legacy || cmd.online {
-		if !cmd.legacy {
+	if cmd.enterprise || cmd.online {
+		if cmd.enterprise {
 			if filepath.Ext(cmd.backupFilesPath) != ".manifest" {
 				return fmt.Errorf("when using -enterprise, must provide path to a manifest file")
 			}
@@ -132,7 +132,7 @@ func (cmd *Command) parseFlags(args []string) error {
 	fs.StringVar(&cmd.restoreRetention, "newrp", "", "")
 	fs.StringVar(&cmd.shard, "shard", "", "")
 	fs.BoolVar(&cmd.online, "online", false, "")
-	fs.BoolVar(&cmd.legacy, "legacy", false, "")
+	fs.BoolVar(&cmd.enterprise, "enterprise", false, "")
 	fs.SetOutput(cmd.Stdout)
 	fs.Usage = cmd.printUsage
 	if err := fs.Parse(args); err != nil {
@@ -148,7 +148,7 @@ func (cmd *Command) parseFlags(args []string) error {
 		return fmt.Errorf("path with backup files required")
 	}
 
-	if !cmd.legacy || cmd.online {
+	if cmd.enterprise || cmd.online {
 		// validate the arguments
 		if cmd.sourceDatabase == "" {
 			return fmt.Errorf("-db is a required parameter")
@@ -299,7 +299,7 @@ func (cmd *Command) unpackMeta() error {
 func (cmd *Command) updateMetaLive() error {
 
 	var metaBytes []byte
-	if !cmd.legacy {
+	if cmd.enterprise {
 		fileName := filepath.Join(cmd.backupFilesPath, cmd.manifest.Meta.FileName)
 
 		fileBytes, err := ioutil.ReadFile(fileName)
@@ -439,7 +439,7 @@ func (cmd *Command) unpackShard(shardID string) error {
 // unpackFiles will look for backup files matching the pattern and restore them to the data dir
 func (cmd *Command) uploadShardsLive() error {
 	// find the destinationDatabase backup files
-	if !cmd.legacy {
+	if cmd.enterprise {
 		for _, file := range cmd.manifest.Files {
 			if cmd.sourceDatabase == "" || cmd.sourceDatabase == file.Database {
 				if cmd.backupRetention == "" || cmd.backupRetention == file.Policy {
@@ -655,9 +655,9 @@ retention policies, or specific shards.  Legacy mode requires the instance to be
 	all databases from the system (e.g., for disaster recovery).  The improved online mode requires the instance to be running,
 	and the database name used must not already exist.
 
-Usage: influxd restore [-legacy] [flags] PATH
+Usage: influxd restore [-enterprise] [flags] PATH
 
-Legacy mode consumes files in the pre-1.5 file format. PATH is a directory containing the backup data
+The default mode consumes files in an OSS only file format. PATH is a directory containing the backup data
 
 Options:
     -metadir <path>
@@ -678,7 +678,7 @@ Options:
 	        Optional. If given, the restore will be done using the new process, detailed below.  All above legacy
 	        arguments are ignored.
 
-Default Restore mode consumes files in an improved format that includes a file manifest.  PATH should indicate
+The -enterprise restore mode consumes files in an improved format that includes a file manifest.  PATH should indicate
 the manifest file.
 
 Options:
